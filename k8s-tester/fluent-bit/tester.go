@@ -12,83 +12,107 @@ import (
 
 	"github.com/aws/aws-k8s-tester/client"
 	k8s_tester "github.com/aws/aws-k8s-tester/k8s-tester/tester"
+	"github.com/aws/aws-k8s-tester/utils/rand"
+	utils_time "github.com/aws/aws-k8s-tester/utils/time"
 	"github.com/manifoldco/promptui"
 	"go.uber.org/zap"
-	k8s_client "k8s.io/client-go/kubernetes"
 )
 
 type Config struct {
-	EnablePrompt bool
+	Enable bool `json:"enable"`
+	Prompt bool `json:"-"`
 
-	Logger    *zap.Logger
-	LogWriter io.Writer
-	Stopc     chan struct{}
+	Stopc     chan struct{} `json:"-"`
+	Logger    *zap.Logger   `json:"-"`
+	LogWriter io.Writer     `json:"-"`
+	Client    client.Client `json:"-"`
 
-	ClientConfig *client.Config
-
+	// MinimumNodes is the minimum number of Kubernetes nodes required for installing this addon.
+	MinimumNodes int `json:"minimum_nodes"`
 	// Namespace to create test resources.
-	Namespace string
+	Namespace string `json:"namespace"`
 }
 
-func New(cfg Config) k8s_tester.Tester {
-	ccfg, err := client.CreateConfig(cfg.ClientConfig)
-	if err != nil {
-		cfg.Logger.Panic("failed to create client config", zap.Error(err))
-	}
-	cli, err := k8s_client.NewForConfig(ccfg)
-	if err != nil {
-		cfg.Logger.Panic("failed to create client", zap.Error(err))
-	}
+const DefaultMinimumNodes int = 1
 
+func NewDefault() *Config {
+	return &Config{
+		Enable:       false,
+		Prompt:       false,
+		MinimumNodes: DefaultMinimumNodes,
+		Namespace:    pkgName + "-" + rand.String(10) + "-" + utils_time.GetTS(10),
+	}
+}
+
+func New(cfg *Config) k8s_tester.Tester {
 	return &tester{
 		cfg: cfg,
-		cli: cli,
 	}
 }
 
 type tester struct {
-	cfg Config
-	cli k8s_client.Interface
+	cfg *Config
 }
 
 var pkgName = path.Base(reflect.TypeOf(tester{}).PkgPath())
 
+func Env() string {
+	return "ADD_ON_" + strings.ToUpper(strings.Replace(pkgName, "-", "_", -1))
+}
+
 func (ts *tester) Name() string { return pkgName }
+
+func (ts *tester) Enabled() bool { return ts.cfg.Enable }
 
 func (ts *tester) Apply() error {
 	if ok := ts.runPrompt("apply"); !ok {
 		return errors.New("cancelled")
 	}
-	if err := client.CreateNamespace(ts.cfg.Logger, ts.cli, ts.cfg.Namespace); err != nil {
+
+	if nodes, err := client.ListNodes(ts.cfg.Client.KubernetesClient()); len(nodes) < ts.cfg.MinimumNodes || err != nil {
+		return fmt.Errorf("failed to validate minimum nodes requirement %d (nodes %v, error %v)", ts.cfg.MinimumNodes, len(nodes), err)
+	}
+
+	if err := client.CreateNamespace(ts.cfg.Logger, ts.cfg.Client.KubernetesClient(), ts.cfg.Namespace); err != nil {
 		return err
 	}
+
 	if err := ts.createServiceAccount(); err != nil {
 		return err
 	}
+
 	if err := ts.createRBACClusterRole(); err != nil {
 		return err
 	}
+
 	if err := ts.createRBACClusterRoleBinding(); err != nil {
 		return err
 	}
+
 	if err := ts.createAppConfigMap(); err != nil {
 		return err
 	}
+
 	if err := ts.createDaemonSet(); err != nil {
 		return err
 	}
+
 	if err := ts.checkDaemonSet(); err != nil {
 		return err
 	}
+
 	if err := ts.createService(); err != nil {
 		return err
 	}
+
 	if err := ts.testHTTPClient(); err != nil {
 		return err
 	}
+
 	if err := ts.testLogsWithinNamespace(); err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -101,7 +125,7 @@ func (ts *tester) Delete() error {
 
 	if err := client.DeleteServiceAccount(
 		ts.cfg.Logger,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		ts.cfg.Namespace,
 		appServiceAccountName,
 	); err != nil {
@@ -111,7 +135,7 @@ func (ts *tester) Delete() error {
 
 	if err := client.DeleteRBACRole(
 		ts.cfg.Logger,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		ts.cfg.Namespace,
 		appRBACRoleName,
 	); err != nil {
@@ -121,7 +145,7 @@ func (ts *tester) Delete() error {
 
 	if err := client.DeleteRBACRoleBinding(
 		ts.cfg.Logger,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		ts.cfg.Namespace,
 		appRBACRoleBindingName,
 	); err != nil {
@@ -131,7 +155,7 @@ func (ts *tester) Delete() error {
 
 	if err := client.DeleteConfigmap(
 		ts.cfg.Logger,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		ts.cfg.Namespace,
 		appConfigMapNameConfig,
 	); err != nil {
@@ -141,7 +165,7 @@ func (ts *tester) Delete() error {
 
 	if err := client.DeleteDaemonSet(
 		ts.cfg.Logger,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		ts.cfg.Namespace,
 		appName,
 	); err != nil {
@@ -153,7 +177,7 @@ func (ts *tester) Delete() error {
 
 	if err := client.DeleteService(
 		ts.cfg.Logger,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		ts.cfg.Namespace,
 		appName,
 	); err != nil {
@@ -163,7 +187,7 @@ func (ts *tester) Delete() error {
 
 	if err := client.DeletePod(
 		ts.cfg.Logger,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		ts.cfg.Namespace,
 		containerHTTPClient,
 	); err != nil {
@@ -173,7 +197,7 @@ func (ts *tester) Delete() error {
 
 	if err := client.DeletePod(
 		ts.cfg.Logger,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		ts.cfg.Namespace,
 		loggingPod,
 	); err != nil {
@@ -183,7 +207,7 @@ func (ts *tester) Delete() error {
 
 	if err := client.DeleteNamespaceAndWait(
 		ts.cfg.Logger,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		ts.cfg.Namespace,
 		client.DefaultNamespaceDeletionInterval,
 		client.DefaultNamespaceDeletionTimeout,
@@ -194,11 +218,12 @@ func (ts *tester) Delete() error {
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, ", "))
 	}
+
 	return nil
 }
 
 func (ts *tester) runPrompt(action string) (ok bool) {
-	if ts.cfg.EnablePrompt {
+	if ts.cfg.Prompt {
 		msg := fmt.Sprintf("Ready to %q resources for the namespace %q, should we continue?", action, ts.cfg.Namespace)
 		prompt := promptui.Select{
 			Label: msg,

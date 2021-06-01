@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
 
 	"github.com/aws/aws-k8s-tester/client"
 	fluent_bit "github.com/aws/aws-k8s-tester/k8s-tester/fluent-bit"
@@ -14,7 +15,7 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:        "k8s-tester-fluent-bit",
-	Short:      "Kubernetes fluent bit",
+	Short:      "Kubernetes fluent bit tester",
 	SuggestFor: []string{"fluent-bit"},
 }
 
@@ -23,21 +24,25 @@ func init() {
 }
 
 var (
-	enablePrompt   bool
-	logLevel       string
-	logOutputs     []string
-	namespace      string
-	kubectlPath    string
-	kubeConfigPath string
+	prompt             bool
+	logLevel           string
+	logOutputs         []string
+	minimumNodes       int
+	namespace          string
+	kubectlDownloadURL string
+	kubectlPath        string
+	kubeconfigPath     string
 )
 
 func init() {
-	rootCmd.PersistentFlags().BoolVar(&enablePrompt, "enable-prompt", true, "'true' to enable prompt mode")
+	rootCmd.PersistentFlags().BoolVar(&prompt, "prompt", true, "'true' to enable prompt mode")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", log.DefaultLogLevel, "Logging level")
 	rootCmd.PersistentFlags().StringSliceVar(&logOutputs, "log-outputs", []string{"stderr"}, "Additional logger outputs")
+	rootCmd.PersistentFlags().IntVar(&minimumNodes, "minimum-nodes", fluent_bit.DefaultMinimumNodes, "minimum number of Kubernetes nodes required for installing this addon")
 	rootCmd.PersistentFlags().StringVar(&namespace, "namespace", "test-namespace", "'true' to auto-generate path for create config/cluster, overwrites existing --path value")
-	rootCmd.PersistentFlags().StringVar(&kubectlPath, "kubectl-path", "", "kubectl path")
-	rootCmd.PersistentFlags().StringVar(&kubeConfigPath, "kubeconfig-path", "", "KUBECONFIG path")
+	rootCmd.PersistentFlags().StringVar(&kubectlDownloadURL, "kubectl-download-url", fmt.Sprintf("https://storage.googleapis.com/kubernetes-release/release/v1.21.0/bin/%s/%s/kubectl", runtime.GOOS, runtime.GOARCH), "kubectl download URL")
+	rootCmd.PersistentFlags().StringVar(&kubectlPath, "kubectl-path", "/tmp/kubectl-test-v1.21.0", "kubectl path")
+	rootCmd.PersistentFlags().StringVar(&kubeconfigPath, "kubeconfig-path", "", "KUBECONFIG path")
 
 	rootCmd.AddCommand(
 		newApply(),
@@ -70,16 +75,23 @@ func createApplyFunc(cmd *cobra.Command, args []string) {
 	}
 	_ = zap.ReplaceGlobals(lg)
 
-	cfg := fluent_bit.Config{
-		EnablePrompt: enablePrompt,
+	cli, err := client.New(&client.Config{
+		Logger:             lg,
+		KubectlDownloadURL: kubectlDownloadURL,
+		KubectlPath:        kubectlPath,
+		KubeconfigPath:     kubeconfigPath,
+	})
+	if err != nil {
+		lg.Panic("failed to create client", zap.Error(err))
+	}
+
+	cfg := &fluent_bit.Config{
+		Prompt:       prompt,
 		Logger:       lg,
 		LogWriter:    logWriter,
+		MinimumNodes: minimumNodes,
 		Namespace:    namespace,
-		ClientConfig: &client.Config{
-			Logger:         lg,
-			KubectlPath:    kubectlPath,
-			KubeConfigPath: kubeConfigPath,
-		},
+		Client:       cli,
 	}
 
 	ts := fluent_bit.New(cfg)
@@ -108,16 +120,22 @@ func createDeleteFunc(cmd *cobra.Command, args []string) {
 	}
 	_ = zap.ReplaceGlobals(lg)
 
-	cfg := fluent_bit.Config{
-		EnablePrompt: enablePrompt,
-		Logger:       lg,
-		LogWriter:    logWriter,
-		Namespace:    namespace,
-		ClientConfig: &client.Config{
-			Logger:         lg,
-			KubectlPath:    kubectlPath,
-			KubeConfigPath: kubeConfigPath,
-		},
+	cli, err := client.New(&client.Config{
+		Logger:             lg,
+		KubectlDownloadURL: kubectlDownloadURL,
+		KubectlPath:        kubectlPath,
+		KubeconfigPath:     kubeconfigPath,
+	})
+	if err != nil {
+		lg.Panic("failed to create client", zap.Error(err))
+	}
+
+	cfg := &fluent_bit.Config{
+		Prompt:    prompt,
+		Logger:    lg,
+		LogWriter: logWriter,
+		Namespace: namespace,
+		Client:    cli,
 	}
 
 	ts := fluent_bit.New(cfg)

@@ -1,4 +1,5 @@
 // Package nlb_hello_world installs a simple "Hello World" application with NLB.
+// Replace https://github.com/aws/aws-k8s-tester/tree/v1.5.9/eks/nlb-hello-world.
 package nlb_hello_world
 
 import (
@@ -14,58 +15,107 @@ import (
 
 	"github.com/aws/aws-k8s-tester/client"
 	k8s_tester "github.com/aws/aws-k8s-tester/k8s-tester/tester"
+	aws_v1 "github.com/aws/aws-k8s-tester/utils/aws/v1"
+	aws_v1_elb "github.com/aws/aws-k8s-tester/utils/aws/v1/elb"
 	"github.com/aws/aws-k8s-tester/utils/http"
+	"github.com/aws/aws-k8s-tester/utils/rand"
+	utils_time "github.com/aws/aws-k8s-tester/utils/time"
+	"github.com/aws/aws-sdk-go/service/elbv2"
+	"github.com/aws/aws-sdk-go/service/elbv2/elbv2iface"
 	"github.com/manifoldco/promptui"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	apps_v1 "k8s.io/api/apps/v1"
 	core_v1 "k8s.io/api/core/v1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	k8s_client "k8s.io/client-go/kubernetes"
 	"k8s.io/utils/exec"
 )
 
 type Config struct {
-	EnablePrompt bool
+	Enable bool `json:"enable"`
+	Prompt bool `json:"-"`
 
-	Logger    *zap.Logger
-	LogWriter io.Writer
-	Stopc     chan struct{}
+	Stopc     chan struct{} `json:"-"`
+	Logger    *zap.Logger   `json:"-"`
+	LogWriter io.Writer     `json:"-"`
+	Client    client.Client `json:"-"`
 
-	ClientConfig *client.Config
+	ELB2API elbv2iface.ELBV2API `json:"-"`
 
+	AccountID string `json:"account_id" read-only:"true"`
+	Partition string `json:"partition"`
+	Region    string `json:"region"`
+
+	// MinimumNodes is the minimum number of Kubernetes nodes required for installing this addon.
+	MinimumNodes int `json:"minimum_nodes"`
 	// Namespace to create test resources.
-	Namespace string
+	Namespace string `json:"namespace"`
 
-	DeploymentNodeSelector map[string]string
-	DeploymentReplicas     int32
+	// DeploymentNodeSelector is configured to overwrite existing node selector
+	// for hello world deployment. If left empty, tester sets default selector.
+	DeploymentNodeSelector map[string]string `json:"deployment_node_selector"`
+	// DeploymentReplicas is the number of replicas to deploy using "Deployment" object.
+	DeploymentReplicas int32 `json:"deployment_replicas"`
+
+	// ELBARN is the ARN of the ELB created from the service.
+	ELBARN string `json:"elb_arn" read-only:"true"`
+	// ELBName is the name of the ELB created from the service.
+	ELBName string `json:"elb_name" read-only:"true"`
+	// ELBURL is the host name for hello-world service.
+	ELBURL string `json:"elb_url" read-only:"true"`
 }
 
-func New(cfg Config) k8s_tester.Tester {
-	ccfg, err := client.CreateConfig(cfg.ClientConfig)
-	if err != nil {
-		cfg.Logger.Panic("failed to create client config", zap.Error(err))
+const (
+	DefaultMinimumNodes       int   = 1
+	DefaultDeploymentReplicas int32 = 2
+)
+
+func NewDefault() *Config {
+	return &Config{
+		Enable:             false,
+		Prompt:             false,
+		MinimumNodes:       DefaultMinimumNodes,
+		Namespace:          pkgName + "-" + rand.String(10) + "-" + utils_time.GetTS(10),
+		DeploymentReplicas: DefaultDeploymentReplicas,
 	}
-	cli, err := k8s_client.NewForConfig(ccfg)
+}
+
+func New(cfg *Config) k8s_tester.Tester {
+	awsCfg := aws_v1.Config{
+		Logger:        cfg.Logger,
+		DebugAPICalls: cfg.Logger.Core().Enabled(zapcore.DebugLevel),
+		Partition:     cfg.Partition,
+		Region:        cfg.Region,
+	}
+	awsSession, stsOutput, _, err := aws_v1.New(&awsCfg)
 	if err != nil {
-		cfg.Logger.Panic("failed to create client", zap.Error(err))
+		panic(err)
+	}
+	cfg.ELB2API = elbv2.New(awsSession)
+	if cfg.AccountID == "" && stsOutput.Account != nil {
+		cfg.AccountID = *stsOutput.Account
 	}
 
 	return &tester{
 		cfg: cfg,
-		cli: cli,
 	}
 }
 
 type tester struct {
-	cfg Config
-	cli k8s_client.Interface
+	cfg *Config
 }
 
 var pkgName = path.Base(reflect.TypeOf(tester{}).PkgPath())
 
+func Env() string {
+	return "ADD_ON_" + strings.ToUpper(strings.Replace(pkgName, "-", "_", -1))
+}
+
 func (ts *tester) Name() string { return pkgName }
+
+func (ts *tester) Enabled() bool { return ts.cfg.Enable }
 
 const (
 	deploymentName = "hello-world-deployment"
@@ -79,13 +129,18 @@ func (ts *tester) Apply() error {
 		return errors.New("cancelled")
 	}
 
-	if err := client.CreateNamespace(ts.cfg.Logger, ts.cli, ts.cfg.Namespace); err != nil {
+	if nodes, err := client.ListNodes(ts.cfg.Client.KubernetesClient()); len(nodes) < ts.cfg.MinimumNodes || err != nil {
+		return fmt.Errorf("failed to validate minimum nodes requirement %d (nodes %v, error %v)", ts.cfg.MinimumNodes, len(nodes), err)
+	}
+
+	if err := client.CreateNamespace(ts.cfg.Logger, ts.cfg.Client.KubernetesClient(), ts.cfg.Namespace); err != nil {
 		return err
 	}
 
 	if err := ts.createDeployment(); err != nil {
 		return err
 	}
+
 	if err := ts.checkDeployment(); err != nil {
 		return err
 	}
@@ -93,6 +148,7 @@ func (ts *tester) Apply() error {
 	if err := ts.createService(); err != nil {
 		return err
 	}
+
 	waitDur := 3 * time.Minute
 	ts.cfg.Logger.Info("waiting for NLB hello-world Service", zap.Duration("wait", waitDur))
 	select {
@@ -100,6 +156,7 @@ func (ts *tester) Apply() error {
 		return errors.New("NLB hello-world Service apply aborted")
 	case <-time.After(waitDur):
 	}
+
 	if err := ts.checkService(); err != nil {
 		return err
 	}
@@ -114,9 +171,31 @@ func (ts *tester) Delete() error {
 
 	var errs []string
 
+	// get ELB ARN before deleting the service
+	if ts.cfg.ELBARN == "" {
+		_, elbARN, elbName, exists, err := client.FindServiceIngressHostname(
+			ts.cfg.Logger,
+			ts.cfg.Client.KubernetesClient(),
+			ts.cfg.Namespace,
+			serviceName,
+			ts.cfg.Stopc,
+			3*time.Minute,
+			ts.cfg.AccountID,
+			ts.cfg.Region,
+		)
+		if err != nil {
+			if exists { // maybe already deleted from previous run
+				errs = append(errs, fmt.Sprintf("ELB exists but failed to find ingress ELB ARN (%v)", err))
+			}
+		}
+		ts.cfg.ELBARN = elbARN
+		ts.cfg.ELBName = elbName
+	}
+
+	ts.cfg.Logger.Info("deleting service", zap.String("service-name", serviceName))
 	if err := client.DeleteService(
 		ts.cfg.Logger,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		ts.cfg.Namespace,
 		serviceName,
 	); err != nil {
@@ -125,9 +204,10 @@ func (ts *tester) Delete() error {
 	ts.cfg.Logger.Info("wait for a minute after deleting Service")
 	time.Sleep(time.Minute)
 
+	ts.cfg.Logger.Info("deleting deployment", zap.String("deployment-name", deploymentName))
 	if err := client.DeleteDeployment(
 		ts.cfg.Logger,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		ts.cfg.Namespace,
 		deploymentName,
 	); err != nil {
@@ -136,9 +216,27 @@ func (ts *tester) Delete() error {
 	ts.cfg.Logger.Info("wait for a minute after deleting Deployment")
 	time.Sleep(time.Minute)
 
+	/*
+	  proactively delete ELB resource
+	  ref. https://github.com/aws/aws-k8s-tester/blob/v1.5.9/eks/nlb-hello-world/nlb-hello-world.go#L135-L154
+
+	  # NLB tags
+	  kubernetes.io/service-name
+	  leegyuho-test-prod-nlb-hello-world/hello-world-service
+	  kubernetes.io/cluster/leegyuho-test-prod
+	  owned
+	*/
+	if err := aws_v1_elb.DeleteELBv2(
+		ts.cfg.Logger,
+		ts.cfg.ELB2API,
+		ts.cfg.ELBARN,
+	); err != nil {
+		errs = append(errs, fmt.Sprintf("failed to delete ELB (%v)", err))
+	}
+
 	if err := client.DeleteNamespaceAndWait(
 		ts.cfg.Logger,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		ts.cfg.Namespace,
 		client.DefaultNamespaceDeletionInterval,
 		client.DefaultNamespaceDeletionTimeout,
@@ -155,7 +253,7 @@ func (ts *tester) Delete() error {
 }
 
 func (ts *tester) runPrompt(action string) (ok bool) {
-	if ts.cfg.EnablePrompt {
+	if ts.cfg.Prompt {
 		msg := fmt.Sprintf("Ready to %q resources for the namespace %q, should we continue?", action, ts.cfg.Namespace)
 		prompt := promptui.Select{
 			Label: msg,
@@ -185,7 +283,7 @@ func (ts *tester) createDeployment() error {
 	}
 	ts.cfg.Logger.Info("creating NLB hello-world Deployment", zap.Any("node-selector", nodeSelector))
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	_, err := ts.cli.
+	_, err := ts.cfg.Client.KubernetesClient().
 		AppsV1().
 		Deployments(ts.cfg.Namespace).
 		Create(
@@ -258,7 +356,7 @@ func (ts *tester) checkDeployment() error {
 		ts.cfg.Logger,
 		ts.cfg.LogWriter,
 		ts.cfg.Stopc,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		time.Minute,
 		20*time.Second,
 		ts.cfg.Namespace,
@@ -266,8 +364,8 @@ func (ts *tester) checkDeployment() error {
 		ts.cfg.DeploymentReplicas,
 		client.WithQueryFunc(func() {
 			descArgs := []string{
-				ts.cfg.ClientConfig.KubectlPath,
-				"--kubeconfig=" + ts.cfg.ClientConfig.KubeConfigPath,
+				ts.cfg.Client.Config().KubectlPath,
+				"--kubeconfig=" + ts.cfg.Client.Config().KubeconfigPath,
 				"--namespace=" + ts.cfg.Namespace,
 				"describe",
 				"deployment",
@@ -291,7 +389,7 @@ func (ts *tester) checkDeployment() error {
 func (ts *tester) createService() error {
 	ts.cfg.Logger.Info("creating NLB hello-world Service")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	_, err := ts.cli.
+	_, err := ts.cfg.Client.KubernetesClient().
 		CoreV1().
 		Services(ts.cfg.Namespace).
 		Create(
@@ -337,11 +435,11 @@ func (ts *tester) createService() error {
 	return nil
 }
 
-func (ts *tester) checkService() error {
+func (ts *tester) checkService() (err error) {
 	queryFunc := func() {
 		args := []string{
-			ts.cfg.ClientConfig.KubectlPath,
-			"--kubeconfig=" + ts.cfg.ClientConfig.KubeConfigPath,
+			ts.cfg.Client.Config().KubectlPath,
+			"--kubeconfig=" + ts.cfg.Client.Config().KubeconfigPath,
 			"--namespace=" + ts.cfg.Namespace,
 			"describe",
 			"svc",
@@ -359,34 +457,29 @@ func (ts *tester) checkService() error {
 		}
 	}
 
-	hostName, err := client.WaitForServiceIngressHostname(
+	hostName, elbARN, elbName, err := client.WaitForServiceIngressHostname(
 		ts.cfg.Logger,
-		ts.cli,
+		ts.cfg.Client.KubernetesClient(),
 		ts.cfg.Namespace,
 		serviceName,
 		ts.cfg.Stopc,
 		3*time.Minute,
+		ts.cfg.AccountID,
+		ts.cfg.Region,
 		client.WithQueryFunc(queryFunc),
 	)
 	if err != nil {
 		return err
 	}
+	elbURL := "http://" + hostName
 
-	// TODO: is there any better way to find out the NLB name?
-	nlbName := strings.Split(hostName, "-")[0]
-	ss := strings.Split(hostName, ".")[0]
-	ss = strings.Replace(ss, "-", "/", -1)
-	nlbARN := fmt.Sprintf(
-		"arn:aws:elasticloadbalancing:%s:%s:loadbalancer/net/%s",
-		"region",
-		"account-id",
-		ss,
-	)
-	appURL := "http://" + hostName
+	ts.cfg.ELBARN = elbARN
+	ts.cfg.ELBName = elbName
+	ts.cfg.ELBURL = elbURL
 
-	fmt.Fprintf(ts.cfg.LogWriter, "\nNLB hello-world ARN: %s\n", nlbARN)
-	fmt.Fprintf(ts.cfg.LogWriter, "NLB hello-world Name: %s\n", nlbName)
-	fmt.Fprintf(ts.cfg.LogWriter, "NLB hello-world URL: %s\n\n", appURL)
+	fmt.Fprintf(ts.cfg.LogWriter, "\nNLB hello-world ARN: %s\n", elbARN)
+	fmt.Fprintf(ts.cfg.LogWriter, "NLB hello-world name: %s\n", elbName)
+	fmt.Fprintf(ts.cfg.LogWriter, "NLB hello-world URL: %s\n\n", elbURL)
 
 	ts.cfg.Logger.Info("waiting before testing hello-world Service")
 	time.Sleep(20 * time.Second)
@@ -400,7 +493,7 @@ func (ts *tester) checkService() error {
 		case <-time.After(5 * time.Second):
 		}
 
-		out, err := http.ReadInsecure(ts.cfg.Logger, ioutil.Discard, appURL)
+		out, err := http.ReadInsecure(ts.cfg.Logger, ioutil.Discard, elbURL)
 		if err != nil {
 			ts.cfg.Logger.Warn("failed to read NLB hello-world Service; retrying", zap.Error(err))
 			time.Sleep(5 * time.Second)
@@ -418,12 +511,12 @@ func (ts *tester) checkService() error {
 		ts.cfg.Logger.Warn("unexpected hello-world Service output; retrying")
 	}
 
-	fmt.Fprintf(ts.cfg.LogWriter, "\nNLB hello-world ARN: %s\n", nlbARN)
-	fmt.Fprintf(ts.cfg.LogWriter, "NLB hello-world Name: %s\n", nlbName)
-	fmt.Fprintf(ts.cfg.LogWriter, "NLB hello-world URL: %s\n\n", appURL)
+	fmt.Fprintf(ts.cfg.LogWriter, "\nNLB hello-world ARN: %s\n", elbARN)
+	fmt.Fprintf(ts.cfg.LogWriter, "NLB hello-world name: %s\n", elbName)
+	fmt.Fprintf(ts.cfg.LogWriter, "NLB hello-world URL: %s\n\n", elbURL)
 
 	if !htmlChecked {
-		return fmt.Errorf("NLB hello-world %q did not return expected HTML output", appURL)
+		return fmt.Errorf("NLB hello-world %q did not return expected HTML output", elbURL)
 	}
 
 	return nil

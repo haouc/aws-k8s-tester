@@ -199,6 +199,8 @@ var caImages = map[string]string{
 	"1.16": `        - image: us.gcr.io/k8s-artifacts-prod/autoscaling/cluster-autoscaler:v1.16.5`,
 	"1.17": `        - image: us.gcr.io/k8s-artifacts-prod/autoscaling/cluster-autoscaler:v1.17.2`,
 	"1.18": `        - image: us.gcr.io/k8s-artifacts-prod/autoscaling/cluster-autoscaler:v1.18.0`,
+	"1.19": `        - image: us.gcr.io/k8s-artifacts-prod/autoscaling/cluster-autoscaler:v1.19.0`,
+	"1.20": `        - image: us.gcr.io/k8s-artifacts-prod/autoscaling/cluster-autoscaler:v1.20.0`,
 }
 
 const (
@@ -287,7 +289,7 @@ func (ts *tester) installCA() error {
 		fpath,
 	}
 	applyCmd := strings.Join(applyArgs, " ")
-	for time.Now().Sub(retryStart) < waitDur {
+	for time.Since(retryStart) < waitDur {
 		select {
 		case <-ts.cfg.Stopc:
 			return errors.New("create CA aborted")

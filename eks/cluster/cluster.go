@@ -161,7 +161,7 @@ func (ts *tester) checkHealth(caller string) (err error) {
 	// might take several minutes for DNS to propagate
 	waitDur := 5 * time.Minute
 	retryStart := time.Now()
-	for time.Now().Sub(retryStart) < waitDur {
+	for time.Since(retryStart) < waitDur {
 		select {
 		case <-ts.cfg.Stopc:
 			return errors.New("health check aborted")
@@ -235,7 +235,7 @@ Parameters:
 
   Version:
     Type: String
-    Default: 1.18
+    Default: 1.20
     Description: Specify the EKS version
 
   RoleARN:
@@ -882,7 +882,7 @@ func (ts *tester) createClient() (cli k8s_client.EKS, err error) {
 		)
 		retryStart, waitDur := time.Now(), 3*time.Minute
 		var output []byte
-		for time.Now().Sub(retryStart) < waitDur {
+		for time.Since(retryStart) < waitDur {
 			select {
 			case <-ts.cfg.Stopc:
 				return nil, errors.New("update-kubeconfig aborted")
